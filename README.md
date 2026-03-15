@@ -5,12 +5,14 @@ A high-performance liver disease diagnostic system leveraging **Soft-Voting Ense
 ---
 
 ## 📄 Technical Documentation
+### PLZ SEEE THE FILES BELOW FOR LOGIC AND IMPLEMENTATIONS.
 Detailed specifications and logs are located in the main directory:
 * **[Technical Logic Spec](https://github.com/vishwajeetpawar123/lguard-backend/blob/main/HepaGuard_mathematical_logic.pdf)**: Deep dive into the Ensemble math and staging heuristics.
 * **[Development Walkthrough](https://github.com/vishwajeetpawar123/lguard-backend/blob/main/WALKTHROUGH.md)**: Proof of work, verification results, and build history.
 * **[Implementation Plan](https://github.com/vishwajeetpawar123/lguard-backend/blob/main/IMPLEMENTATION_PLAN.md)**: The architectural roadmap for the project.
 
 ---
+### FROM HERE REST IS TRASH
 
 ## 🚀 Deployment Option
 
