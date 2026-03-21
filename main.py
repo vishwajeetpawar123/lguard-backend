@@ -8,6 +8,7 @@ import io
 import matplotlib.pyplot as plt
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from typing import Optional
 from pydantic import BaseModel, Field
 
 # --- Initialize FastAPI ---
@@ -48,16 +49,16 @@ def load_pipeline():
 
 # --- Input Schema ---
 class PatientData(BaseModel):
-    age: float = Field(..., ge=1, le=120)
-    gender: str = Field(..., description="'Male' or 'Female'")
-    tot_bilirubin: float = Field(..., ge=0.0)
-    direct_bilirubin: float = Field(..., ge=0.0)
-    alkphos: float = Field(..., ge=0.0)
-    sgpt: float = Field(..., ge=0.0)
-    sgot: float = Field(..., ge=0.0)
-    tot_proteins: float = Field(..., ge=0.0)
-    albumin: float = Field(..., ge=0.0)
-    ag_ratio: float = Field(..., ge=0.0)
+    age: Optional[float] = Field(None, ge=1, le=120)
+    gender: Optional[str] = Field(None, description="'Male' or 'Female'")
+    tot_bilirubin: Optional[float] = Field(None, ge=0.0)
+    direct_bilirubin: Optional[float] = Field(None, ge=0.0)
+    alkphos: Optional[float] = Field(None, ge=0.0)
+    sgpt: Optional[float] = Field(None, ge=0.0)
+    sgot: Optional[float] = Field(None, ge=0.0)
+    tot_proteins: Optional[float] = Field(None, ge=0.0)
+    albumin: Optional[float] = Field(None, ge=0.0)
+    ag_ratio: Optional[float] = Field(None, ge=0.0)
 
 # --- Staging Logic ---
 def get_stage_confidence(score, prediction):
@@ -89,19 +90,32 @@ def get_robust_liver_score(row):
     if bilirubin > 1.2: score += min((bilirubin - 1.2) * 1.5, 10.0)
         
     ast, alt = row['sgot'], row['sgpt']
-    ratio = ast / alt if alt > 0 else 1.0
-    if ratio > 1.5: score += 3.0
-    if ratio > 2.0: score += 5.0
+    # De Ritis Ratio: Core penalties for severe elevations
+    if ast > 40 or alt > 40:
+        ratio = ast / alt if alt > 0 else 1.0
+        if ratio > 1.5: score += 3.0
+        if ratio > 2.0: score += 5.0
         
     albumin = row['albumin']
     if albumin < 3.5: score += ((3.5 - albumin) * 4.0)
+        
+    ag_ratio = row['ag_ratio']
         
     alkphos = row['alkphos']
     if alkphos > 300: score += 4.0
         
     age = row['age']
     if age > 60: score *= 1.1
-        
+
+    # Option 2: Conditional Multipliers for Advanced Cirrhosis Markers
+    # Only apply these heavy red flags if the liver is already showing significant damage
+    if score >= 5.0:
+        if (ast > 40 or alt > 40) and (alt > 0 and (ast / alt) > 1.0):
+            score += 2.0
+            
+        if ag_ratio < 1.0:
+            score += 3.0
+            
     return score
 
 def assign_liver_stage(row, prediction):
@@ -117,6 +131,35 @@ def assign_liver_stage(row, prediction):
     if score >= 5:  return 2, "Stage 2 (Fibrosis/Significant)"
     return 1, "Stage 1 (Early/Mild)"
 
+def generate_shap_text_explanation(shap_vals, feature_names, stage_code, stage_text):
+    """Generates a dynamic 2-sentence clinical explanation string based on the top SHAP features."""
+    contributions = list(zip(feature_names, shap_vals))
+    
+    # Positive SHAP pushes toward Disease (Risk-increasing)
+    positive_contributors = sorted([c for c in contributions if c[1] > 0], key=lambda x: x[1], reverse=True)
+    # Negative SHAP pushes toward Healthy (Risk-reducing / Protective)
+    negative_contributors = sorted([c for c in contributions if c[1] < 0], key=lambda x: x[1])
+    
+    top_pos = [f"**{c[0]}**" for c in positive_contributors[:2]]
+    top_neg = [f"**{c[0]}**" for c in negative_contributors[:2]]
+    
+    if stage_code == 0:
+        text = "The AI confidently affirmed a healthy liver profile. "
+        if top_neg: # These are the strongest drivers for the 'Healthy' class
+            text += f"The strongest biomarker indicators supporting this healthy diagnosis were normal {', '.join(top_neg)}. "
+        if top_pos: # These slightly pushed towards disease but failed to overcome the threshold
+            text += f"All other evaluated biomarkers, including {', '.join(top_pos)}, were determined to be completely within safe clinical tolerances."
+        else:
+            text += "All evaluated biomarkers were completely within normal hepatic ranges."
+    else:
+        text = f"The AI diagnosed {stage_text}. "
+        if top_pos:
+            text += f"This assessment was most heavily driven by elevated {', '.join(top_pos)}, which significantly elevated the clinical risk profile. "
+        if top_neg:
+            text += f"Conversely, {', '.join(top_neg)} acted as counter-balancing factors, preventing an even more severe risk estimate."
+            
+    return text.strip()
+
 # --- Main Endpoint ---
 @app.post("/predict")
 async def predict_liver_disease(patient: PatientData):
@@ -129,8 +172,10 @@ async def predict_liver_disease(patient: PatientData):
         df_input = pd.DataFrame([data])
         
         # Apply strict Imputation & Preprocessing
-        num_cols = df_input.select_dtypes(include=np.number).columns.drop('gender', errors='ignore')
-        df_input.loc[:, num_cols] = imputers['num_imputer'].transform(df_input[num_cols])
+        expected_num_cols = ['age', 'tot_bilirubin', 'direct_bilirubin', 'alkphos', 'sgpt', 'sgot', 'tot_proteins', 'albumin', 'ag_ratio']
+        df_input[expected_num_cols] = df_input[expected_num_cols].astype(float)
+        
+        df_input.loc[:, expected_num_cols] = imputers['num_imputer'].transform(df_input[expected_num_cols])
         df_input[['gender']] = imputers['cat_imputer'].transform(df_input[['gender']])
         df_input['gender'] = df_input['gender'].map({'Male': 1, 'Female': 0}).astype(int)
 
@@ -191,6 +236,12 @@ async def predict_liver_disease(patient: PatientData):
         img_base64 = base64.b64encode(buf.read()).decode('utf-8')
         plt.close(fig)
 
+        # 4. Generate Text-Based XAI Summary
+        text_explanation = generate_shap_text_explanation(shap_values[0], display_names, stage_code, meta['label'])
+
+        # Prepare safe native python dictionary for imputed values
+        safe_imputed_data = {k: float(v) if isinstance(v, (np.float32, np.float64)) else int(v) if isinstance(v, (np.int32, np.int64)) else v for k, v in df_input.iloc[0].to_dict().items()}
+
         return {
             "success": True,
             "prediction_code": stage_code,
@@ -199,7 +250,9 @@ async def predict_liver_disease(patient: PatientData):
             "color": meta['color'],
             "clinical_description": meta['desc'],
             "stage_confidence": conf_dist,
-            "shap_plot_base64": img_base64
+            "shap_plot_base64": img_base64,
+            "text_explanation": text_explanation,
+            "imputed_data": safe_imputed_data
         }
     
     except Exception as e:
