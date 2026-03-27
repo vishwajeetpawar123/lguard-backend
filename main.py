@@ -1,4 +1,5 @@
 import os
+import math
 import pickle
 import numpy as np
 import pandas as pd
@@ -28,9 +29,9 @@ app.add_middleware(
 )
 
 # --- Load Models & Imputers ---
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-MODEL_PATH = os.environ.get('MODEL_PATH', os.path.join(BASE_DIR, 'models', 'ensemble_model.pkl'))
-IMPUTER_PATH = os.environ.get('IMPUTER_PATH', os.path.join(BASE_DIR, 'models', 'imputers.pkl'))
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+MODEL_PATH = os.path.join(BASE_DIR, 'ensemble_model.pkl')
+IMPUTER_PATH = os.path.join(BASE_DIR, 'imputers.pkl')
 
 ensemble = None
 imputers = None
@@ -66,7 +67,6 @@ def get_stage_confidence(score, prediction):
     Generates a simulated confidence distribution across stages 0-4
     based on the clinical severity score and the AI's binary prediction.
     """
-    import math
     def gaussian(x, mu, sig):
         return math.exp(-pow(x - mu, 2.) / (2 * pow(sig, 2.)))
 
@@ -74,8 +74,10 @@ def get_stage_confidence(score, prediction):
     mids = [0.5, 3.0, 7.5, 12.5, 17.5]
     
     if prediction == 0:
-        # Healthy prediction: Heavy weight on Stage 0
-        raw = [0.95, 0.03, 0.01, 0.005, 0.005]
+        # Score-aware healthy confidence: borderline scores get slightly less certainty
+        base_healthy = max(0.80, 0.98 - score * 0.15)
+        remainder = 1.0 - base_healthy
+        raw = [base_healthy, remainder * 0.6, remainder * 0.25, remainder * 0.1, remainder * 0.05]
     else:
         # Disease prediction: Use Gaussian centered at the patient's score
         sigma = 3.5 # Spread to ensure neighboring stages get some weight
@@ -84,38 +86,67 @@ def get_stage_confidence(score, prediction):
     total = sum(raw)
     return [round(r/total, 3) for r in raw]
 
+def _safe_get(row, key, default=0.0):
+    """Safely extract a numeric value from the row, returning default if missing or invalid."""
+    try:
+        val = float(row[key])
+        if np.isnan(val) or np.isinf(val):
+            return default
+        return val
+    except (KeyError, TypeError, ValueError):
+        return default
+
 def get_robust_liver_score(row):
     score = 0.0
-    bilirubin = row['tot_bilirubin']
-    if bilirubin > 1.2: score += min((bilirubin - 1.2) * 1.5, 10.0)
-        
-    ast, alt = row['sgot'], row['sgpt']
-    # De Ritis Ratio: Core penalties for severe elevations
+
+    # --- Extract values with safe defaults ---
+    bilirubin = _safe_get(row, 'tot_bilirubin', 0.0)
+    ast = _safe_get(row, 'sgot', 0.0)
+    alt = _safe_get(row, 'sgpt', 0.0)
+    albumin = _safe_get(row, 'albumin', 4.0)  # Default to normal
+    ag_ratio = _safe_get(row, 'ag_ratio', 1.5)  # Default to normal
+    alkphos = _safe_get(row, 'alkphos', 0.0)
+    age = _safe_get(row, 'age', 30.0)
+
+    # --- Bilirubin (capped contribution) ---
+    if bilirubin > 1.2:
+        score += min((bilirubin - 1.2) * 1.5, 10.0)
+
+    # --- De Ritis Ratio: penalties for severe elevations ---
     if ast > 40 or alt > 40:
-        ratio = ast / alt if alt > 0 else 1.0
+        if alt > 0:
+            ratio = ast / alt
+        else:
+            # ALT ≈ 0 with elevated AST is clinically very concerning
+            ratio = 999.0
         if ratio > 1.5: score += 3.0
         if ratio > 2.0: score += 5.0
-        
-    albumin = row['albumin']
-    if albumin < 3.5: score += ((3.5 - albumin) * 4.0)
-        
-    ag_ratio = row['ag_ratio']
-        
-    alkphos = row['alkphos']
-    if alkphos > 300: score += 4.0
-        
-    age = row['age']
-    if age > 60: score *= 1.1
 
-    # Option 2: Conditional Multipliers for Advanced Cirrhosis Markers
+    # --- Albumin ---
+    if albumin < 3.5:
+        score += ((3.5 - albumin) * 4.0)
+
+    # --- A/G Ratio: base penalty (always applied) ---
+    if ag_ratio < 1.0:
+        score += 1.5  # Mild base penalty for abnormal A/G ratio
+
+    # --- Alkaline Phosphatase (graduated scale) ---
+    if alkphos > 120:
+        score += min((alkphos - 120) * 0.02, 6.0)
+
+    # --- Age modifier ---
+    if age > 60:
+        score *= 1.1
+
+    # --- Conditional Multipliers for Advanced Cirrhosis Markers ---
     # Only apply these heavy red flags if the liver is already showing significant damage
     if score >= 5.0:
         if (ast > 40 or alt > 40) and (alt > 0 and (ast / alt) > 1.0):
             score += 2.0
-            
+
         if ag_ratio < 1.0:
-            score += 3.0
-            
+            score += 3.0  # Additional penalty on top of the base 1.5
+
     return score
 
 def assign_liver_stage(row, prediction):
@@ -190,17 +221,18 @@ async def predict_liver_disease(patient: PatientData):
         final_prob = disease_probability
         if stage_code == 0:
             final_prob = 1.0 - disease_probability
-            # If the Clinical Heuristic overrides an ML Disease prediction
+            # If the Clinical Heuristic overrides an ML Disease prediction,
+            # use a tempered confidence (the ML model disagreed, so certainty is lower)
             if base_prediction == 1:
-                final_prob = 0.95
+                final_prob = max(0.60, 1.0 - disease_probability)
 
         # Determine Response Metadata
         stage_map = {
             0: {"label": "Healthy Liver", "color": "#00cc66", "prob": final_prob, "desc": "No significant clinical markers detected. Liver tests are completely within normal ranges."},
             1: {"label": "Stage 1: Early/Mild", "color": "#f1c40f", "prob": final_prob, "desc": "Inflammation detected. Early warning signs."},
-            2: {"label": "Stage 2: Significant", "color": "#e67e22", "prob": final_prob, "desc": "Significant risk. Early scarring and enzyme elevations."},
-            3: {"label": "Stage 3: Severe", "color": "#e74c3c", "prob": final_prob, "desc": "Severe risk. Sharp protein drops/critical damage."},
-            4: {"label": "Stage 4: Critical", "color": "#8b0000", "prob": final_prob, "desc": "Critical risk. Filter and synthesis markers compromised."}
+            2: {"label": "Stage 2: Fibrosis/Significant", "color": "#e67e22", "prob": final_prob, "desc": "Significant risk. Early scarring and enzyme elevations."},
+            3: {"label": "Stage 3: Cirrhosis/Severe", "color": "#e74c3c", "prob": final_prob, "desc": "Severe risk. Sharp protein drops/critical damage."},
+            4: {"label": "Stage 4: End-Stage/Critical", "color": "#8b0000", "prob": final_prob, "desc": "Critical risk. Filter and synthesis markers compromised."}
         }
         meta = stage_map[stage_code]
         
