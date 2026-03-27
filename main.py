@@ -29,9 +29,9 @@ app.add_middleware(
 )
 
 # --- Load Models & Imputers ---
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-MODEL_PATH = os.path.join(BASE_DIR, 'ensemble_model.pkl')
-IMPUTER_PATH = os.path.join(BASE_DIR, 'imputers.pkl')
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+MODEL_PATH = os.environ.get('MODEL_PATH', os.path.join(BASE_DIR, 'models', 'ensemble_model.pkl'))
+IMPUTER_PATH = os.environ.get('IMPUTER_PATH', os.path.join(BASE_DIR, 'models', 'imputers.pkl'))
 
 ensemble = None
 imputers = None
